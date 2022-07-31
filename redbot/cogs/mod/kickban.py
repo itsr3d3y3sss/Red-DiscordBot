@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import discord
 from redbot.core import commands, i18n, checks, modlog
-from redbot.core.commands import UserInputOptional, RawUserIdConverter
+from redbot.core.commands import UserInputOptional
 from redbot.core.utils import AsyncIter
 from redbot.core.utils.chat_formatting import (
     pagify,
@@ -17,6 +17,7 @@ from redbot.core.utils.chat_formatting import (
 )
 from redbot.core.utils.mod import get_audit_reason
 from .abc import MixinMeta
+from .converters import RawUserIds
 from .utils import is_allowed_by_hierarchy
 
 log = logging.getLogger("red.mod")
@@ -29,13 +30,28 @@ class KickBanMixin(MixinMeta):
     """
 
     @staticmethod
-    async def get_invite_for_reinvite(ctx: commands.Context, max_age: int = 86400) -> str:
-        """Handles the reinvite logic for getting an invite to send the newly unbanned user"""
+    async def get_invite_for_reinvite(ctx: commands.Context, max_age: int = 86400):
+        """Handles the reinvite logic for getting an invite
+        to send the newly unbanned user
+        :returns: :class:`Invite`"""
         guild = ctx.guild
         my_perms: discord.Permissions = guild.me.guild_permissions
         if my_perms.manage_guild or my_perms.administrator:
-            if guild.vanity_url is not None:
-                return guild.vanity_url
+            if "VANITY_URL" in guild.features:
+                # guild has a vanity url so use it as the one to send
+                try:
+                    invite = await guild.vanity_invite()
+                    # `if` is needed to work around
+                    # https://github.com/Rapptz/discord.py/issues/7103
+                    # until we can use a version with the fix
+                    if invite.code is not None:
+                        return invite
+                except discord.NotFound:
+                    # If a guild has the vanity url feature,
+                    # but does not have it set up,
+                    # this prevents the command from failing
+                    # and defaults back to another regular invite.
+                    pass
             invites = await guild.invites()
         else:
             invites = []
@@ -45,22 +61,22 @@ class KickBanMixin(MixinMeta):
                 # has unlimited uses, doesn't expire, and
                 # doesn't grant temporary membership
                 # (i.e. they won't be kicked on disconnect)
-                return inv.url
+                return inv
         else:  # No existing invite found that is valid
-            channels_and_perms = (
-                (channel, channel.permissions_for(guild.me)) for channel in guild.text_channels
+            channels_and_perms = zip(
+                guild.text_channels, map(guild.me.permissions_in, guild.text_channels)
             )
             channel = next(
                 (channel for channel, perms in channels_and_perms if perms.create_instant_invite),
                 None,
             )
             if channel is None:
-                return ""
+                return
             try:
                 # Create invite that expires after max_age
-                return (await channel.create_invite(max_age=max_age)).url
+                return await channel.create_invite(max_age=max_age)
             except discord.HTTPException:
-                return ""
+                return
 
     @staticmethod
     async def _voice_perm_check(
@@ -193,7 +209,7 @@ class KickBanMixin(MixinMeta):
                         author.name, author.id, ban_type, username, user.id, str(days)
                     )
                 )
-                success_message = _("Done. That felt good.")
+                success_message = _("User has been banned.")
             except discord.Forbidden:
                 return False, _("I'm not allowed to do that.")
             except discord.NotFound:
@@ -210,7 +226,7 @@ class KickBanMixin(MixinMeta):
             await modlog.create_case(
                 self.bot,
                 guild,
-                ctx.message.created_at,
+                ctx.message.created_at.replace(tzinfo=timezone.utc),
                 ban_type,
                 user,
                 author,
@@ -283,18 +299,6 @@ class KickBanMixin(MixinMeta):
     @commands.bot_has_permissions(kick_members=True)
     @checks.admin_or_permissions(kick_members=True)
     async def kick(self, ctx: commands.Context, member: discord.Member, *, reason: str = None):
-        """
-        Kick a user.
-
-        Examples:
-           - `[p]kick 428675506947227648 wanted to be kicked.`
-            This will kick the user with ID 428675506947227648 from the server.
-           - `[p]kick @Twentysix wanted to be kicked.`
-            This will kick Twentysix from the server.
-
-        If a reason is specified, it will be the reason that shows up
-        in the audit log.
-        """
         author = ctx.author
         guild = ctx.guild
 
@@ -346,7 +350,7 @@ class KickBanMixin(MixinMeta):
             await modlog.create_case(
                 self.bot,
                 guild,
-                ctx.message.created_at,
+                ctx.message.created_at.replace(tzinfo=timezone.utc),
                 "kick",
                 member,
                 author,
@@ -354,7 +358,7 @@ class KickBanMixin(MixinMeta):
                 until=None,
                 channel=None,
             )
-            await ctx.send(_("Done. That felt good."))
+            await ctx.send(_("User has been kicked."))
 
     @commands.command()
     @commands.guild_only()
@@ -363,25 +367,11 @@ class KickBanMixin(MixinMeta):
     async def ban(
         self,
         ctx: commands.Context,
-        user: Union[discord.Member, RawUserIdConverter],
+        user: Union[discord.Member, RawUserIds],
         days: Optional[int] = None,
         *,
         reason: str = None,
     ):
-        """Ban a user from this server and optionally delete days of messages.
-
-        `days` is the amount of days of messages to cleanup on ban.
-
-        Examples:
-           - `[p]ban 428675506947227648 7 Continued to spam after told to stop.`
-            This will ban the user with ID 428675506947227648 and it will delete 7 days worth of messages.
-           - `[p]ban @Twentysix 7 Continued to spam after told to stop.`
-            This will ban Twentysix and it will delete 7 days worth of messages.
-
-        A user ID should be provided if the user is not a member of this server.
-        If days is not a number, it's treated as the first word of the reason.
-        Minimum 0 days, maximum 7. If not specified, the defaultdays setting will be used instead.
-        """
         guild = ctx.guild
         if days is None:
             days = await self.config.guild(guild).default_days()
@@ -401,22 +391,11 @@ class KickBanMixin(MixinMeta):
     async def massban(
         self,
         ctx: commands.Context,
-        user_ids: commands.Greedy[RawUserIdConverter],
+        user_ids: commands.Greedy[RawUserIds],
         days: Optional[int] = None,
         *,
         reason: str = None,
     ):
-        """Mass bans user(s) from the server.
-
-        `days` is the amount of days of messages to cleanup on massban.
-
-        Example:
-           - `[p]massban 345628097929936898 57287406247743488 7 they broke all rules.`
-            This will ban all the added userids and delete 7 days worth of their messages.
-
-        User IDs need to be provided in order to ban
-        using this command.
-        """
         banned = []
         errors = {}
         upgrades = []
@@ -556,7 +535,7 @@ class KickBanMixin(MixinMeta):
             await modlog.create_case(
                 self.bot,
                 guild,
-                ctx.message.created_at,
+                ctx.message.created_at.replace(tzinfo=timezone.utc),
                 "hackban",
                 user_id,
                 author,
@@ -579,19 +558,6 @@ class KickBanMixin(MixinMeta):
         *,
         reason: str = None,
     ):
-        """Temporarily ban a user from this server.
-
-        `duration` is the amount of time the user should be banned for.
-        `days` is the amount of days of messages to cleanup on tempban.
-
-        Examples:
-           - `[p]tempban @Twentysix Because I say so`
-            This will ban Twentysix for the default amount of time set by an administrator.
-           - `[p]tempban @Twentysix 15m You need a timeout`
-            This will ban Twentysix for 15 minutes.
-           - `[p]tempban 428675506947227648 1d2h15m 5 Evil person`
-            This will ban the user with ID 428675506947227648 for 1 day 2 hours 15 minutes and will delete the last 5 days of their messages.
-        """
         guild = ctx.guild
         author = ctx.author
 
@@ -626,6 +592,8 @@ class KickBanMixin(MixinMeta):
             await ctx.send(_("Invalid days. Must be between 0 and 7."))
             return
         invite = await self.get_invite_for_reinvite(ctx, int(duration.total_seconds() + 86400))
+        if invite is None:
+            invite = ""
 
         await self.config.member(member).banned_until.set(unban_time.timestamp())
         async with self.config.guild(guild).current_tempbans() as current_tempbans:
@@ -634,7 +602,7 @@ class KickBanMixin(MixinMeta):
         with contextlib.suppress(discord.HTTPException):
             # We don't want blocked DMs preventing us from banning
             msg = _("You have been temporarily banned from {server_name} until {date}.").format(
-                server_name=guild.name, date=discord.utils.format_dt(unban_time)
+                server_name=guild.name, date=f"<t:{int(unban_time.timestamp())}>"
             )
             if guild_data["dm_on_kickban"] and reason:
                 msg += _("\n\n**Reason:** {reason}").format(reason=reason)
@@ -656,14 +624,14 @@ class KickBanMixin(MixinMeta):
             await modlog.create_case(
                 self.bot,
                 guild,
-                ctx.message.created_at,
+                ctx.message.created_at.replace(tzinfo=timezone.utc),
                 "tempban",
                 member,
                 author,
                 reason,
                 unban_time,
             )
-            await ctx.send(_("Done. Enough chaos for now."))
+            await ctx.send(_("User has been temp-banned."))
 
     @commands.command()
     @commands.guild_only()
@@ -694,6 +662,8 @@ class KickBanMixin(MixinMeta):
         audit_reason = get_audit_reason(author, reason, shorten=True)
 
         invite = await self.get_invite_for_reinvite(ctx)
+        if invite is None:
+            invite = ""
 
         try:  # We don't want blocked DMs preventing us from banning
             msg = await member.send(
@@ -736,7 +706,7 @@ class KickBanMixin(MixinMeta):
             await modlog.create_case(
                 self.bot,
                 guild,
-                ctx.message.created_at,
+                ctx.message.created_at.replace(tzinfo=timezone.utc),
                 "softban",
                 member,
                 author,
@@ -744,7 +714,7 @@ class KickBanMixin(MixinMeta):
                 until=None,
                 channel=None,
             )
-            await ctx.send(_("Done. Enough chaos."))
+            await ctx.send(_("User has been softbanned."))
 
     @commands.command()
     @commands.guild_only()
@@ -783,7 +753,7 @@ class KickBanMixin(MixinMeta):
             await modlog.create_case(
                 self.bot,
                 guild,
-                ctx.message.created_at,
+                ctx.message.created_at.replace(tzinfo=timezone.utc),
                 "vkick",
                 member,
                 author,
@@ -826,7 +796,7 @@ class KickBanMixin(MixinMeta):
         await modlog.create_case(
             self.bot,
             guild,
-            ctx.message.created_at,
+            ctx.message.created_at.replace(tzinfo=timezone.utc),
             "voiceunban",
             member,
             author,
@@ -867,7 +837,7 @@ class KickBanMixin(MixinMeta):
         await modlog.create_case(
             self.bot,
             guild,
-            ctx.message.created_at,
+            ctx.message.created_at.replace(tzinfo=timezone.utc),
             "voiceban",
             member,
             author,
@@ -881,9 +851,7 @@ class KickBanMixin(MixinMeta):
     @commands.guild_only()
     @commands.bot_has_permissions(ban_members=True)
     @checks.admin_or_permissions(ban_members=True)
-    async def unban(
-        self, ctx: commands.Context, user_id: RawUserIdConverter, *, reason: str = None
-    ):
+    async def unban(self, ctx: commands.Context, user_id: RawUserIds, *, reason: str = None):
         """Unban a user from this server.
 
         Requires specifying the target user's ID. To find this, you may either:
@@ -907,7 +875,7 @@ class KickBanMixin(MixinMeta):
             await modlog.create_case(
                 self.bot,
                 guild,
-                ctx.message.created_at,
+                ctx.message.created_at.replace(tzinfo=timezone.utc),
                 "unban",
                 ban_entry.user,
                 author,
@@ -932,7 +900,7 @@ class KickBanMixin(MixinMeta):
                         _(
                             "You've been unbanned from {server}.\n"
                             "Here is an invite for that server: {invite_link}"
-                        ).format(server=guild.name, invite_link=invite)
+                        ).format(server=guild.name, invite_link=invite.url)
                     )
                 except discord.Forbidden:
                     await ctx.send(
@@ -940,12 +908,12 @@ class KickBanMixin(MixinMeta):
                             "I failed to send an invite to that user. "
                             "Perhaps you may be able to send it for me?\n"
                             "Here's the invite link: {invite_link}"
-                        ).format(invite_link=invite)
+                        ).format(invite_link=invite.url)
                     )
                 except discord.HTTPException:
                     await ctx.send(
                         _(
                             "Something went wrong when attempting to send that user "
                             "an invite. Here's the link so you can try: {invite_link}"
-                        ).format(invite_link=invite)
+                        ).format(invite_link=invite.url)
                     )
